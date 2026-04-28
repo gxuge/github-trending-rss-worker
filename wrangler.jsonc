@@ -1,5 +1,5 @@
 {
-    "name": "github-trending-rss-api",
+    "name": "github-trending-rss-worker",
     "main": "src/index.js",
     "compatibility_date": "2026-04-28",
     "workers_dev": true
