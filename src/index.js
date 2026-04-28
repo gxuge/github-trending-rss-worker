@@ -1,11 +1,11 @@
 const RSS_BASE_URL = "https://gxuge.github.io/GitHubTrendingRSS";
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname !== "/" && url.pathname !== "/trending") {
-      return json({ error: "not_found", path: url.pathname }, 404);
+      return json({ error: "not_found" }, 404);
     }
 
     const token = url.searchParams.get("token");
@@ -13,11 +13,15 @@ export default {
       return json({ error: "unauthorized" }, 401);
     }
 
-    const since = url.searchParams.get("since") || "weekly";
+    const since = url.searchParams.get("since") || "daily";
     const language = (url.searchParams.get("language") || "all").toLowerCase();
+    const raw = url.searchParams.get("raw") === "1";
 
     if (!["daily", "weekly", "monthly"].includes(since)) {
-      return json({ error: "invalid_since" }, 400);
+      return json({
+        error: "invalid_since",
+        allowed: ["daily", "weekly", "monthly"]
+      }, 400);
     }
 
     if (!/^[a-z0-9+#.\-]+$/.test(language)) {
@@ -25,6 +29,11 @@ export default {
     }
 
     const rssUrl = `${RSS_BASE_URL}/${since}/${language}.xml`;
+
+    const cacheKey = new Request(url.toString(), request);
+    const cache = caches.default;
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
 
     const res = await fetch(rssUrl, {
       headers: {
@@ -42,18 +51,38 @@ export default {
     }
 
     const xml = await res.text();
+
+    if (raw) {
+      const response = new Response(xml, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/xml; charset=utf-8",
+          "Cache-Control": "public, max-age=1800"
+        }
+      });
+      ctx.waitUntil(cache.put(cacheKey, response.clone()));
+      return response;
+    }
+
     const items = parseRssItems(xml);
 
-    return json({
-      ok: true,
+    const output = {
       source: "GitHubTrendingRSS",
-      rssUrl,
+      rssBaseUrl: RSS_BASE_URL,
       since,
       language,
+      rssUrl,
       count: items.length,
       items,
       fetchedAt: new Date().toISOString()
+    };
+
+    const response = json(output, 200, {
+      "Cache-Control": "public, max-age=1800"
     });
+
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    return response;
   }
 };
 
@@ -61,12 +90,12 @@ function parseRssItems(xml) {
   const blocks = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].map(m => m[1]);
 
   return blocks.map((block, index) => {
-    const title = getTag(block, "title");
-    const link = getTag(block, "link");
-    const descriptionRaw = getTag(block, "description");
-    const pubDate = getTag(block, "pubDate");
+    const title = text(block, "title");
+    const link = text(block, "link");
+    const descriptionRaw = text(block, "description");
+    const pubDate = text(block, "pubDate");
 
-    const repoFullName = parseRepoFromLink(link) || title;
+    const repoFullName = parseRepoFromLink(link) || normalizeRepoName(title);
     const [owner = "", repo = ""] = repoFullName.split("/");
 
     return {
@@ -82,19 +111,24 @@ function parseRssItems(xml) {
   });
 }
 
-function getTag(block, tag) {
-  const match = block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
-  return match ? decodeXml(match[1].trim()) : "";
+function text(block, tag) {
+  const m = block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`));
+  if (!m) return "";
+  return decodeXml(m[1].trim());
 }
 
 function parseRepoFromLink(link) {
-  const match = link.match(/github\.com\/([^/]+\/[^/?#]+)/i);
-  return match ? match[1] : "";
+  const m = link.match(/github\.com\/([^/]+\/[^/?#]+)/);
+  return m ? m[1] : "";
 }
 
-function stripHtml(value) {
+function normalizeRepoName(title) {
+  return title.replace(/\s+/g, "").trim();
+}
+
+function stripHtml(s) {
   return decodeXml(
-    value
+    s
       .replace(/<!\[CDATA\[|\]\]>/g, "")
       .replace(/<[^>]+>/g, " ")
       .replace(/\s+/g, " ")
@@ -102,8 +136,8 @@ function stripHtml(value) {
   );
 }
 
-function decodeXml(value) {
-  return value
+function decodeXml(s) {
+  return s
     .replaceAll("&amp;", "&")
     .replaceAll("&lt;", "<")
     .replaceAll("&gt;", ">")
@@ -111,11 +145,12 @@ function decodeXml(value) {
     .replaceAll("&#39;", "'");
 }
 
-function json(data, status = 200) {
+function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
     headers: {
-      "Content-Type": "application/json; charset=utf-8"
+      "Content-Type": "application/json; charset=utf-8",
+      ...headers
     }
   });
 }
